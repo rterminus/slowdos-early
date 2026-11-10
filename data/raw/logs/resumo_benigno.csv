@@ -1,0 +1,4 @@
+label,pcap_file,conexoes_log,duracao_s
+benigno_only_rep1,/home/alvkro/Projects/apache-edb2/slowloris_testbed/pcaps/benigno_only_rep1.pcap,/home/alvkro/Projects/apache-edb2/slowloris_testbed/logs/benigno_only_rep1_conexoes.csv,120
+benigno_only_rep2,/home/alvkro/Projects/apache-edb2/slowloris_testbed/pcaps/benigno_only_rep2.pcap,/home/alvkro/Projects/apache-edb2/slowloris_testbed/logs/benigno_only_rep2_conexoes.csv,120
+benigno_only_rep3,/home/alvkro/Projects/apache-edb2/slowloris_testbed/pcaps/benigno_only_rep3.pcap,/home/alvkro/Projects/apache-edb2/slowloris_testbed/logs/benigno_only_rep3_conexoes.csv,120
