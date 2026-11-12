@@ -1,0 +1,13 @@
+FROM ubuntu:22.04
+
+# slowhttptest está no repositório 'universe' do Ubuntu
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends slowhttptest ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /output
+
+# ENTRYPOINT fixo em slowhttptest: os parâmetros (-c, -r, -i, -l, -u, -o...)
+# são passados como argumentos do 'docker run', permitindo variar taxa e
+# intervalo sem precisar rebuildar a imagem.
+ENTRYPOINT ["slowhttptest"]
