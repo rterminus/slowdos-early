@@ -2,48 +2,51 @@
 #
 # Orquestra o testbed do P1 (Testbed e captura) para o artigo sobre Slowloris.
 #
+# MUDANÇA IMPORTANTE NESTA VERSÃO: servidor, atacante e cliente benigno agora
+# rodam em TRÊS CONTÊINERES SEPARADOS, numa rede Docker dedicada, cada um com
+# IP fixo e distinto. Antes, atacante e cliente benigno rodavam ambos no
+# host, batendo em "localhost" — ou seja, tinham o MESMO IP de origem, o que
+# tornava impossível diferenciá-los por endereço nos pcaps (ponto levantado
+# na revisão: "não está com IP diferente"). Agora:
+#
+#   servidor (Apache)........ SERVER_IP   (ex: 172.28.0.10)
+#   atacante (slowhttptest).. ATTACKER_IP (ex: 172.28.0.20)
+#   cliente benigno (curl)... BENIGN_IP   (ex: 172.28.0.30)
+#
 # O que este script faz, em ordem:
-#   1. Builda e sobe o Apache em contêiner (poucos workers, fácil de saturar)
-#   2. Captura BENIGN_ONLY_REPETITIONS execuções de tráfego 100% benigno,
-#      SEM nenhum ataque rodando junto — isso é o baseline "limpo" de
-#      negativos, necessário para calcular FPR depois (ver nota abaixo)
-#   3. FASE 2 — varia a TAXA de abertura de conexões (-r do slowhttptest),
-#      com o intervalo entre envios parciais (-i) FIXO. Para cada combinação
-#      de TAXA x REPETIÇÃO:
-#        a. Reinicia o Apache (estado limpo a cada teste)
-#        b. Dispara tráfego benigno em paralelo (cenário realista, misturado
-#           com o ataque — não serve de baseline de FPR, serve pra ver como
-#           o ataque afeta usuários reais durante o incidente)
-#        c. Inicia o tcpdump, gravando um .pcap nomeado pela taxa/repetição
-#        d. Inicia o monitor de conexões retidas (log .csv com timestamp)
-#        e. Roda o slowhttptest (o ataque em si) por ATTACK_DURATION segundos
-#        f. Encerra tráfego benigno, captura e monitor
-#   4. FASE 3 — varia o INTERVALO entre envios parciais (-i do slowhttptest,
-#      a "lentidão" de cada conexão), com a TAXA (-r) FIXA. Mesma mecânica da
-#      Fase 2, mas variando o parâmetro oposto. Isso cobre o ponto levantado
-#      no feedback do P3: a Fase 2 sozinha só varia a velocidade de ABERTURA
-#      de conexões, não a lentidão de CADA conexão — que é o que de fato
-#      caracteriza o comportamento "sorrateiro" do Slowloris.
-#   5. Gera data/manifest.csv, juntando todas as execuções (benignas, Fase 2
-#      e Fase 3) com caminhos relativos, parâmetros usados e IPs.
-#   6. Gera checksums.sha256 dos pcaps e encerra o Apache.
+#   1. Cria a rede Docker dedicada (se não existir) e builda as 3 imagens
+#   2. Sobe o contêiner do servidor com IP fixo
+#   3. FASE 1 — baseline benigno isolado (sem ataque), para calcular FPR depois
+#   4. FASE 2 — varia a TAXA (-r), intervalo (-i) fixo
+#   5. FASE 3 — varia o INTERVALO (-i), taxa (-r) fixa
+#      (em ambas, o cliente benigno roda em paralelo, em seu próprio contêiner)
+#   6. Gera data/manifest.csv com IPs reais, timestamps de início/fim,
+#      ferramenta usada, parâmetros e caminhos relativos
+#   7. Gera checksums.sha256 dos pcaps e encerra tudo
 #
-# NOTA SOBRE FPR (False Positive Rate):
-#   Para calcular FPR, um detector precisa ser testado contra tráfego 100%
-#   legítimo, sem ataque misturado — senão não dá pra saber se uma conexão
-#   "suspeita" era de fato um falso positivo ou era o próprio ataque. Por
-#   isso a etapa 2 roda ISOLADA, antes de qualquer ataque começar. Os pcaps
-#   e logs dela (prefixo "benigno_only_repN") são o seu conjunto de
-#   negativos limpos; os pcaps de ataque (prefixo "taxaX_repY" e
-#   "intervaloY_repZ") são o seu conjunto de positivos.
+# NOTA SOBRE O MONITOR DE CONEXÕES RETIDAS:
+#   Como atacante e cliente benigno agora rodam em contêineres próprios (com
+#   seus próprios namespaces de rede), o host NÃO enxerga mais os sockets
+#   internos deles. Por isso o monitor de conexões passou a rodar via
+#   'docker exec' DENTRO do contêiner do servidor, que é o único lugar onde
+#   faz sentido medir "conexões retidas" mesmo (é o recurso do servidor que
+#   está sendo esgotado).
 #
-# Requisitos no host: docker, slowhttptest, tcpdump, curl, iproute2 (para 'ss'),
-# sha256sum, e permissão de sudo para tcpdump (captura de pacotes exige
-# privilégio).
+# NOTA SOBRE O PONTO DE CAPTURA:
+#   O tcpdump continua rodando no HOST, na interface "any" (enxerga o
+#   tráfego de todas as interfaces, incluindo a bridge Docker da rede
+#   dedicada), filtrando por "host SERVER_IP" — assim captura só o tráfego
+#   de/para o servidor, venha ele do atacante ou do cliente benigno,
+#   cada um com seu IP de origem real.
+#
+# Requisitos no host: docker, tcpdump, curl, sha256sum, e permissão de sudo
+# para tcpdump (captura de pacotes exige privilégio). O slowhttptest e o
+# curl dos "usuários simulados" NÃO precisam estar instalados no host — eles
+# rodam dentro dos contêineres atacante/benigno.
 #
 # ESTRUTURA DE PASTAS ESPERADA (ver README):
 #   repo/
-#   ├─ testbed/          <- este script fica aqui
+#   ├─ testbed/          <- este script e os Dockerfiles ficam aqui
 #   └─ data/raw/pcaps/   <- pcaps vão aqui (fora do git)
 #      data/raw/logs/    <- logs/relatórios vão aqui (dentro do git)
 #      data/manifest.csv <- índice de tudo, com caminhos relativos
@@ -52,39 +55,49 @@
 #   chmod +x orchestrate.sh
 #   sudo ./orchestrate.sh
 #
-# (precisa de sudo por causa do tcpdump; o resto roda como usuário normal)
+# (precisa de sudo por causa do tcpdump; o resto roda como usuário normal,
+# mas o usuário precisa estar no grupo 'docker' ou também rodar com sudo)
 
 set -uo pipefail
 
 # ---------------------------------------------------------------------------
 # CONFIGURAÇÃO — ajuste aqui conforme a escala do seu experimento
 # ---------------------------------------------------------------------------
-CONTAINER_NAME="apache_slowloris_test"
-IMAGE_NAME="apache-testbed"
-TARGET_HOST="localhost"
-TARGET_PORT="8080"
-TARGET_URL="http://${TARGET_HOST}:${TARGET_PORT}/"
+
+# --- Rede Docker dedicada, com IPs fixos para cada papel ---
+NETWORK_NAME="slowloris_net"
+NETWORK_SUBNET="172.28.0.0/24"
+SERVER_IP="172.28.0.10"
+ATTACKER_IP="172.28.0.20"
+BENIGN_IP="172.28.0.30"
+TARGET_PORT="80"                 # porta interna do Apache (sem NAT/publish agora)
+TARGET_URL="http://${SERVER_IP}:${TARGET_PORT}/"
+
+SERVER_CONTAINER="apache_slowloris_test"
+ATTACKER_IMAGE="slowloris-attacker"
+BENIGN_IMAGE="slowloris-benign"
+SERVER_IMAGE="slowloris-server"
+BENIGN_CONTAINER="slowloris_benign_client"
 
 # --- Fase 2: varia a TAXA (-r), intervalo (-i) fixo ---
-RATES=(50 100 200 400)         # conexões novas por segundo que o slowhttptest abre
-FIXED_INTERVAL_FOR_RATE=10      # -i fixo usado durante a Fase 2
-REPETITIONS=3                   # repetições de cada taxa (para variância estatística)
+RATES=(50 100 200 400)          # conexões novas por segundo que o slowhttptest abre
+FIXED_INTERVAL_FOR_RATE=10       # -i fixo usado durante a Fase 2
+REPETITIONS=3                    # repetições de cada taxa
 
 # --- Fase 3: varia o INTERVALO (-i), taxa (-r) fixa ---
-INTERVALS=(5 10 20 30)          # intervalo (s) entre envios parciais de cabeçalho
-FIXED_RATE_FOR_INTERVAL=100      # -r fixo usado durante a Fase 3
-INTERVAL_REPETITIONS=3          # repetições de cada intervalo
+INTERVALS=(5 10 20 30)           # intervalo (s) entre envios parciais de cabeçalho
+FIXED_RATE_FOR_INTERVAL=100       # -r fixo usado durante a Fase 3
+INTERVAL_REPETITIONS=3           # repetições de cada intervalo
 
-ATTACK_DURATION=120              # duração de cada execução de ataque, em segundos (Fases 2 e 3)
-TOTAL_CONNECTIONS=1000           # -c do slowhttptest: total de conexões simultâneas
+ATTACK_DURATION=120               # duração de cada execução de ataque (-l), em segundos
+TOTAL_CONNECTIONS=1000            # -c do slowhttptest: total de conexões simultâneas
 
-BENIGN_CONCURRENT_CLIENTS=5      # nº de "usuários" simulados rodando em paralelo
-BENIGN_MIN_THINK=1               # tempo mínimo (s) entre requisições de um cliente
-BENIGN_MAX_THINK=4               # tempo máximo (s) entre requisições de um cliente
+BENIGN_CONCURRENT_CLIENTS=5       # nº de "usuários" simulados dentro do contêiner benigno
+BENIGN_MIN_THINK=1                # tempo mínimo (s) entre requisições de um cliente
+BENIGN_MAX_THINK=4                # tempo máximo (s) entre requisições de um cliente
 
-BENIGN_ONLY_REPETITIONS=3        # repetições da captura benigna isolada (baseline de FPR)
-BENIGN_ONLY_DURATION=120         # duração de cada captura benigna isolada, em segundos
-                                   # (igual a ATTACK_DURATION, pra ter janelas comparáveis)
+BENIGN_ONLY_REPETITIONS=3         # repetições da captura benigna isolada (baseline de FPR)
+BENIGN_ONLY_DURATION=120          # duração de cada captura benigna isolada, em segundos
 
 # ---------------------------------------------------------------------------
 # CAMINHOS — testbed/ fica dentro do repo, data/ é irmã de testbed/
@@ -99,18 +112,15 @@ LOG_DIR="${REPO_ROOT}/${LOG_REL}"
 MANIFEST_FILE="${REPO_ROOT}/data/manifest.csv"
 CHECKSUMS_FILE="${PCAP_DIR}/checksums.sha256"
 
-CAPTURE_IFACE="any"              # 'any' funciona na maioria dos hosts Linux
-ATTACKER_IP="127.0.0.1"          # slowhttptest/curl rodam no host, contra a porta mapeada
-SERVER_IP=""                      # preenchido depois do container subir (docker inspect)
+CAPTURE_IFACE="any"               # 'any' funciona na maioria dos hosts Linux
 
 mkdir -p "$PCAP_DIR" "$LOG_DIR" "$(dirname "$MANIFEST_FILE")"
 
-BENIGN_CLIENT_PIDS=()
 TCPDUMP_PID=""
 MONITOR_PID=""
 
-# Array em memória com uma linha por execução; viram o manifest.csv no final.
-# Cada elemento: label|tipo|param_nome|param_valor|r|i|duracao_s|pcap_rel|log_rel|report_rel
+# Uma linha por execução; vira o manifest.csv no final. Campos:
+# label|tipo|param_nome|param_valor|r|i|duracao_s|pcap_rel|log_rel|report_rel|hora_inicio|hora_fim|ferramenta
 MANIFEST_ROWS=()
 
 # ---------------------------------------------------------------------------
@@ -121,95 +131,101 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
 }
 
+now_iso() {
+    date '+%Y-%m-%dT%H:%M:%S%z'
+}
+
 check_dependencies() {
     local missing=()
-    for cmd in docker slowhttptest tcpdump curl ss sha256sum; do
+    for cmd in docker tcpdump curl sha256sum; do
         command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
     done
     if [ ${#missing[@]} -ne 0 ]; then
         echo "Faltam dependências no host: ${missing[*]}"
         echo "Instale com algo como:"
-        echo "  sudo apt-get update && sudo apt-get install -y docker.io slowhttptest tcpdump curl iproute2 coreutils"
-        echo "  (Arch: sudo pacman -S docker tcpdump curl iproute2 coreutils ; slowhttptest via AUR)"
+        echo "  sudo apt-get update && sudo apt-get install -y docker.io tcpdump curl coreutils"
+        echo "  (Arch: sudo pacman -S docker tcpdump curl coreutils)"
+        echo "Note: slowhttptest e os clientes benignos agora rodam DENTRO dos"
+        echo "contêineres — não precisam estar instalados no host."
         exit 1
     fi
 }
 
-build_and_start_apache() {
-    log "Buildando imagem do Apache..."
-    docker build -t "$IMAGE_NAME" "$BASE_DIR" || { echo "Build falhou"; exit 1; }
+create_network() {
+    if ! docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
+        log "Criando rede Docker dedicada ${NETWORK_NAME} (${NETWORK_SUBNET})..."
+        docker network create --subnet "$NETWORK_SUBNET" "$NETWORK_NAME" >/dev/null
+    else
+        log "Rede ${NETWORK_NAME} já existe, reaproveitando."
+    fi
+}
 
-    # remove contêiner antigo se existir
-    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+build_images() {
+    log "Buildando imagem do servidor..."
+    docker build -t "$SERVER_IMAGE" -f "${BASE_DIR}/Dockerfile.server" "$BASE_DIR" || { echo "Build do servidor falhou"; exit 1; }
 
-    log "Subindo contêiner $CONTAINER_NAME na porta $TARGET_PORT..."
-    docker run -d --name "$CONTAINER_NAME" -p "${TARGET_PORT}:80" "$IMAGE_NAME" >/dev/null
+    log "Buildando imagem do atacante..."
+    docker build -t "$ATTACKER_IMAGE" -f "${BASE_DIR}/Dockerfile.attacker" "$BASE_DIR" || { echo "Build do atacante falhou"; exit 1; }
 
-    # espera o Apache responder antes de seguir
+    log "Buildando imagem do cliente benigno..."
+    docker build -t "$BENIGN_IMAGE" -f "${BASE_DIR}/Dockerfile.benign" "$BASE_DIR" || { echo "Build do cliente benigno falhou"; exit 1; }
+}
+
+start_server() {
+    docker rm -f "$SERVER_CONTAINER" >/dev/null 2>&1 || true
+    log "Subindo servidor em ${SERVER_IP} (rede ${NETWORK_NAME})..."
+    docker run -d --name "$SERVER_CONTAINER" \
+        --network "$NETWORK_NAME" --ip "$SERVER_IP" \
+        "$SERVER_IMAGE" >/dev/null
+
     for i in $(seq 1 15); do
         if curl -s -o /dev/null "$TARGET_URL"; then
-            log "Apache está no ar."
+            log "Servidor está no ar em ${TARGET_URL}"
             return 0
         fi
         sleep 1
     done
-    echo "Apache não respondeu a tempo."
+    echo "Servidor não respondeu a tempo."
     exit 1
 }
 
-detect_server_ip() {
-    SERVER_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
-    if [ -z "$SERVER_IP" ]; then
-        SERVER_IP="desconhecido"
-    fi
-    log "IP do servidor (contêiner): ${SERVER_IP} | IP do atacante (host): ${ATTACKER_IP}"
-}
-
-restart_apache() {
-    log "Reiniciando Apache para estado limpo..."
-    docker restart "$CONTAINER_NAME" >/dev/null
+restart_server() {
+    log "Reiniciando servidor para estado limpo..."
+    docker restart "$SERVER_CONTAINER" >/dev/null
     for i in $(seq 1 15); do
         if curl -s -o /dev/null "$TARGET_URL"; then
             return 0
         fi
         sleep 1
     done
-    echo "Apache não voltou ao ar após restart."
+    echo "Servidor não voltou ao ar após restart."
     exit 1
 }
 
 start_benign_traffic() {
-    log "Iniciando tráfego benigno de fundo (${BENIGN_CONCURRENT_CLIENTS} clientes simulados)..."
-    BENIGN_CLIENT_PIDS=()
-    for i in $(seq 1 "$BENIGN_CONCURRENT_CLIENTS"); do
-        (
-            while true; do
-                curl -s -o /dev/null "$TARGET_URL"
-                # pausa aleatória entre requisições, simulando um usuário real
-                # pensando/lendo a página, em vez de bater sem parar
-                sleep "$(( (RANDOM % (BENIGN_MAX_THINK - BENIGN_MIN_THINK + 1)) + BENIGN_MIN_THINK ))"
-            done
-        ) &
-        BENIGN_CLIENT_PIDS+=("$!")
-    done
+    log "Iniciando cliente benigno em ${BENIGN_IP} (${BENIGN_CONCURRENT_CLIENTS} usuários simulados)..."
+    docker rm -f "$BENIGN_CONTAINER" >/dev/null 2>&1 || true
+    docker run -d --name "$BENIGN_CONTAINER" \
+        --network "$NETWORK_NAME" --ip "$BENIGN_IP" \
+        -e TARGET_URL="$TARGET_URL" \
+        -e CONCURRENT_CLIENTS="$BENIGN_CONCURRENT_CLIENTS" \
+        -e MIN_THINK="$BENIGN_MIN_THINK" \
+        -e MAX_THINK="$BENIGN_MAX_THINK" \
+        "$BENIGN_IMAGE" >/dev/null
 }
 
 stop_benign_traffic() {
-    if [ ${#BENIGN_CLIENT_PIDS[@]} -gt 0 ]; then
-        log "Parando tráfego benigno..."
-        for pid in "${BENIGN_CLIENT_PIDS[@]}"; do
-            kill "$pid" >/dev/null 2>&1 || true
-            wait "$pid" 2>/dev/null || true
-        done
-        BENIGN_CLIENT_PIDS=()
-    fi
+    docker rm -f "$BENIGN_CONTAINER" >/dev/null 2>&1 || true
 }
 
 start_capture() {
     local pcap_file="$1"
-    tcpdump -i "$CAPTURE_IFACE" -w "$pcap_file" "port ${TARGET_PORT}" >/dev/null 2>&1 &
+    # Filtra por IP do servidor (não por porta): assim captura tudo que
+    # envolve o servidor, venha do atacante ou do cliente benigno, cada um
+    # com seu IP de origem real.
+    tcpdump -i "$CAPTURE_IFACE" -w "$pcap_file" "host ${SERVER_IP}" >/dev/null 2>&1 &
     TCPDUMP_PID=$!
-    sleep 2   # dá tempo do tcpdump abrir o arquivo antes do ataque começar
+    sleep 2   # dá tempo do tcpdump abrir o arquivo antes do tráfego começar
 }
 
 stop_capture() {
@@ -220,11 +236,16 @@ stop_capture() {
 }
 
 start_connection_monitor() {
+    # Roda DENTRO do contêiner do servidor via 'docker exec': é lá que faz
+    # sentido medir "conexões retidas" (é o recurso do servidor sendo
+    # esgotado), e é o único lugar onde o host ainda consegue ver esses
+    # sockets, já que atacante e cliente benigno têm namespaces próprios.
     local log_file="$1"
     echo "timestamp,conexoes_retidas" > "$log_file"
     (
         while true; do
-            count=$(ss -ant 2>/dev/null | awk -v port=":${TARGET_PORT}" '$1=="ESTAB" && $4 ~ port {c++} END{print c+0}')
+            count=$(docker exec "$SERVER_CONTAINER" ss -ant 2>/dev/null \
+                | awk -v port=":${TARGET_PORT}" '$1=="ESTAB" && $4 ~ port {c++} END{print c+0}')
             echo "$(date +%s),${count}" >> "$log_file"
             sleep 1
         done
@@ -240,42 +261,62 @@ stop_connection_monitor() {
 }
 
 run_attack() {
+    # Roda o slowhttptest DENTRO do contêiner atacante, com IP próprio
+    # (ATTACKER_IP). O contêiner é efêmero (--rm): sobe, ataca por
+    # ATTACK_DURATION segundos, e sai sozinho quando o slowhttptest termina.
     local rate="$1"
     local interval="$2"
-    local outfile_prefix="$3"
-    log "Rodando slowhttptest: -r ${rate} (conexões/s), -i ${interval}s, -c ${TOTAL_CONNECTIONS}, -l ${ATTACK_DURATION}s"
-    slowhttptest -c "$TOTAL_CONNECTIONS" -H -i "$interval" -r "$rate" -t GET \
+    local outfile_name="$3"   # só o nome do arquivo, sem caminho
+    log "Rodando slowhttptest (contêiner ${ATTACKER_IP}): -r ${rate}, -i ${interval}s, -c ${TOTAL_CONNECTIONS}, -l ${ATTACK_DURATION}s"
+    docker run --rm --name "slowloris_attacker_run" \
+        --network "$NETWORK_NAME" --ip "$ATTACKER_IP" \
+        -v "${LOG_DIR}:/output" \
+        "$ATTACKER_IMAGE" \
+        -c "$TOTAL_CONNECTIONS" -H -i "$interval" -r "$rate" -t GET \
         -u "$TARGET_URL" -p 3 -l "$ATTACK_DURATION" \
-        -o "${outfile_prefix}" >/dev/null 2>&1
+        -o "/output/${outfile_name}" >/dev/null 2>&1
 }
+
+cleanup() {
+    log "Limpando processos e contêineres..."
+    stop_capture
+    stop_connection_monitor
+    stop_benign_traffic
+    docker rm -f "slowloris_attacker_run" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
+# ---------------------------------------------------------------------------
+# EXECUÇÕES (benigna isolada / ataque) — cada uma registra sua linha no manifest
+# ---------------------------------------------------------------------------
 
 run_benign_only_capture() {
     local label="$1"
     local pcap_file="${PCAP_DIR}/${label}.pcap"
     local conn_log="${LOG_DIR}/${label}_conexoes.csv"
+    local t_inicio t_fim
 
     log "=== Captura benigna isolada: ${label} (sem ataque, ${BENIGN_ONLY_DURATION}s) ==="
 
-    restart_apache
+    restart_server
     start_capture "$pcap_file"
     start_connection_monitor "$conn_log"
+    t_inicio="$(now_iso)"
     start_benign_traffic
 
     sleep "$BENIGN_ONLY_DURATION"
 
     stop_benign_traffic
+    t_fim="$(now_iso)"
     stop_connection_monitor
     stop_capture
 
-    MANIFEST_ROWS+=("${label}|benigno|NA|NA|NA|NA|${BENIGN_ONLY_DURATION}|${PCAP_REL}/${label}.pcap|${LOG_REL}/${label}_conexoes.csv|NA")
+    MANIFEST_ROWS+=("${label}|benigno|NA|NA|NA|NA|${BENIGN_ONLY_DURATION}|${PCAP_REL}/${label}.pcap|${LOG_REL}/${label}_conexoes.csv|NA|${t_inicio}|${t_fim}|curl")
     log "Captura benigna concluída. pcap: ${pcap_file} | log conexões: ${conn_log}"
     sleep 3
 }
 
 run_attack_execution() {
-    # Executa um ataque com -r e -i dados, e registra a linha do manifesto.
-    # param_nome/param_valor indicam qual dos dois foi a variável de interesse
-    # desta rodada (o outro ficou fixo) — útil pra análise depois.
     local label="$1"
     local rate="$2"
     local interval="$3"
@@ -284,22 +325,25 @@ run_attack_execution() {
 
     local pcap_file="${PCAP_DIR}/${label}.pcap"
     local conn_log="${LOG_DIR}/${label}_conexoes.csv"
-    local report_prefix="${LOG_DIR}/${label}_slowhttptest"
+    local report_name="${label}_slowhttptest"
+    local t_inicio t_fim
 
     log "=== Execução: ${label} (r=${rate}, i=${interval}) ==="
 
-    restart_apache
-    start_benign_traffic
+    restart_server
     start_capture "$pcap_file"
     start_connection_monitor "$conn_log"
+    t_inicio="$(now_iso)"
+    start_benign_traffic
 
-    run_attack "$rate" "$interval" "$report_prefix"
+    run_attack "$rate" "$interval" "$report_name"
 
+    stop_benign_traffic
+    t_fim="$(now_iso)"
     stop_connection_monitor
     stop_capture
-    stop_benign_traffic
 
-    MANIFEST_ROWS+=("${label}|ataque|${param_nome}|${param_valor}|${rate}|${interval}|${ATTACK_DURATION}|${PCAP_REL}/${label}.pcap|${LOG_REL}/${label}_conexoes.csv|${LOG_REL}/${label}_slowhttptest.html")
+    MANIFEST_ROWS+=("${label}|ataque|${param_nome}|${param_valor}|${rate}|${interval}|${ATTACK_DURATION}|${PCAP_REL}/${label}.pcap|${LOG_REL}/${label}_conexoes.csv|${LOG_REL}/${report_name}.html|${t_inicio}|${t_fim}|slowhttptest+curl")
     log "Execução concluída. pcap: ${pcap_file} | log conexões: ${conn_log}"
     sleep 3
 }
@@ -307,10 +351,12 @@ run_attack_execution() {
 write_manifest() {
     log "Gerando manifest em ${MANIFEST_FILE}..."
     {
-        echo "label,tipo,param_nome,param_valor,r,i,duracao_s,ip_atacante,ip_servidor,pcap_file,conexoes_log,slowhttptest_report"
+        echo "label,tipo,param_nome,param_valor,r,i,duracao_s,ip_atacante,ip_cliente_benigno,ip_servidor,pcap_file,conexoes_log,slowhttptest_report,hora_inicio,hora_fim,ferramenta"
         for row in "${MANIFEST_ROWS[@]}"; do
-            IFS='|' read -r label tipo param_nome param_valor r i dur pcap_rel log_rel report_rel <<< "$row"
-            echo "${label},${tipo},${param_nome},${param_valor},${r},${i},${dur},${ATTACKER_IP},${SERVER_IP},${pcap_rel},${log_rel},${report_rel}"
+            IFS='|' read -r label tipo param_nome param_valor r i dur pcap_rel log_rel report_rel t_inicio t_fim ferramenta <<< "$row"
+            local ip_atk="$ATTACKER_IP"
+            [ "$tipo" = "benigno" ] && ip_atk="NA"
+            echo "${label},${tipo},${param_nome},${param_valor},${r},${i},${dur},${ip_atk},${BENIGN_IP},${SERVER_IP},${pcap_rel},${log_rel},${report_rel},${t_inicio},${t_fim},${ferramenta}"
         done
     } > "$MANIFEST_FILE"
 }
@@ -321,32 +367,23 @@ generate_checksums() {
         log "Aviso: nenhum pcap encontrado para gerar checksums (ou sha256sum falhou)."
 }
 
-cleanup() {
-    log "Limpando processos em segundo plano..."
-    stop_capture
-    stop_connection_monitor
-    stop_benign_traffic
-}
-trap cleanup EXIT INT TERM
-
 # ---------------------------------------------------------------------------
 # EXECUÇÃO PRINCIPAL
 # ---------------------------------------------------------------------------
 
 check_dependencies
-build_and_start_apache
-detect_server_ip
+create_network
+build_images
+start_server
 
-# ---------------------------------------------------------------------------
-# FASE 1 — baseline benigno isolado (necessário para calcular FPR depois)
-# ---------------------------------------------------------------------------
+log "IPs fixos desta execução: servidor=${SERVER_IP} atacante=${ATTACKER_IP} benigno=${BENIGN_IP}"
+
+# FASE 1 — baseline benigno isolado
 for rep in $(seq 1 "$BENIGN_ONLY_REPETITIONS"); do
     run_benign_only_capture "benigno_only_rep${rep}"
 done
 
-# ---------------------------------------------------------------------------
-# FASE 2 — varia a TAXA (-r), intervalo (-i) fixo em FIXED_INTERVAL_FOR_RATE
-# ---------------------------------------------------------------------------
+# FASE 2 — varia a TAXA (-r), intervalo (-i) fixo
 for rate in "${RATES[@]}"; do
     for rep in $(seq 1 "$REPETITIONS"); do
         label="taxa${rate}_rep${rep}"
@@ -354,9 +391,7 @@ for rate in "${RATES[@]}"; do
     done
 done
 
-# ---------------------------------------------------------------------------
-# FASE 3 — varia o INTERVALO (-i), taxa (-r) fixa em FIXED_RATE_FOR_INTERVAL
-# ---------------------------------------------------------------------------
+# FASE 3 — varia o INTERVALO (-i), taxa (-r) fixa
 for interval in "${INTERVALS[@]}"; do
     for rep in $(seq 1 "$INTERVAL_REPETITIONS"); do
         label="intervalo${interval}_rep${rep}"
@@ -364,9 +399,6 @@ for interval in "${INTERVALS[@]}"; do
     done
 done
 
-# ---------------------------------------------------------------------------
-# FINALIZAÇÃO
-# ---------------------------------------------------------------------------
 write_manifest
 generate_checksums
 
