@@ -21,6 +21,6 @@ def run_pipeline(df: pd.DataFrame):
 if __name__ == "__main__":
     df_raw = pd.read_csv("data/interim/taxa100_rep1_packets.csv")
 
-    print("Initializing feature extraction pipeline...")
+    print("initializing feature extraction pipeline...")
     run_pipeline(df_raw)
-    print("Success! flows_n8_v1 generated in data/processed/")
+    print("success! flows_n8_v1 generated in data/processed/")
