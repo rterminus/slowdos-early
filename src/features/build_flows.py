@@ -2,14 +2,14 @@ import numpy as np
 import pandas as pd
 
 
-def line_per_packet(df: pd.DataFrame, port: int):
+def line_per_packet(df: pd.DataFrame, port: int, n_max: int):
     # copying df for modifying and sorting by stream + timestamp
     df_feat = df.copy()
     df_feat = df_feat.sort_values(by=["tcp.stream", "frame.time_epoch"])
 
     # creating flow i column
     df_feat["i"] = df_feat.groupby("tcp.stream").cumcount()
-    df_feat = df_feat[df_feat["i"] < 8]
+    df_feat = df_feat[df_feat["i"] < n_max]
 
     # checking direction: 1 if client->server, otherwise -1
     df_feat["b_dir"] = np.where(df_feat["tcp.srcport"] == port, -1, 1)
