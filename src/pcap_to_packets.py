@@ -1,7 +1,7 @@
 import subprocess
 from pathlib import Path
 
-from src import config
+import config
 
 
 def extract_pcap(pcap_path: Path, output_csv: Path):

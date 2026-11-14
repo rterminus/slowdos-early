@@ -1,9 +1,9 @@
 import pandas as pd
 
+import config
 from features.assemble import merge_features_labels
 from features.build_flows import flatten_flows, line_per_packet
 from features.label import extract_labels
-from src import config
 
 
 def run_pipeline(df: pd.DataFrame):
