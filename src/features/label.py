@@ -16,5 +16,6 @@ def extract_labels(df: pd.DataFrame, port: int, attacker_ip: str) -> pd.DataFram
 
     # formatting the output dataframe
     df_labels = pd.DataFrame({"tcp.stream": ips.index, "label": labels})
+    df_labels = df_labels.rename(columns={"tcp.stream": "flow_id"})
 
     return df_labels

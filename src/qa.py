@@ -6,7 +6,7 @@ import config
 def check_data_leakage(df: pd.DataFrame):
     df_check = df.copy()
 
-    allowed_prefixes = ("b_", "f_", "h_", "tcp.stream", "label")
+    allowed_prefixes = ("b_", "f_", "h_", "t_", "n_", "flow_id", "label")
     for column in df.columns:
         assert column.startswith(allowed_prefixes), f"data leakage detected: {column}"
 
