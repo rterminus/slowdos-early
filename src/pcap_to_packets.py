@@ -1,4 +1,6 @@
+import re
 import subprocess
+import sys
 from pathlib import Path
 
 import config
@@ -37,14 +39,22 @@ def extract_pcap(pcap_path: Path, output_csv: Path):
 
 
 def main():
+    valid_pattern = re.compile(r"^(taxa\d+|intervalo\d+|benigno_only)_rep\d+$")
+
+    pcap_dir = config.RAW_DIR / "pcaps"
+
     print(f"searching .pcap files in {config.RAW_DIR}...")
 
-    for pcap_file in config.RAW_DIR.glob("*.pcap"):
-        csv_name = f"{pcap_file.stem}_packets.csv"
+    for pcap_path in pcap_dir.glob("*.pcap"):
+        if not valid_pattern.match(pcap_path.stem):
+            print(f"ignoring non-pattern file: {pcap_path.name}")
+
+        csv_name = f"{pcap_path.stem}_packets.csv"
         output_path = config.INTERIM_DIR / csv_name
 
-        print(f"extracting {pcap_file.name} → {csv_name}")
-        extract_pcap(pcap_file, output_path)
+        print(f"extracting {pcap_path.name} → {csv_name}")
+        extract_pcap(pcap_path, output_path)
+
 
 if __name__ == "__main__":
     main()
