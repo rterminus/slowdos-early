@@ -1,2 +1,12 @@
 temp.py
 __pycache__/
+
+# raw capture files
+data/raw/**/*.pcap
+data/raw/**/*.pcapng
+data/interim/*.csv
+data/processed/*.csv
+
+# control files
+!data/**/.gitkeep
+!data/raw/README.md
