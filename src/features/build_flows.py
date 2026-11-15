@@ -7,6 +7,29 @@ def line_per_packet(df: pd.DataFrame, port: int, n_max: int):
     df_feat = df.copy()
     df_feat = df_feat.sort_values(by=["tcp.stream", "frame.time_epoch"])
 
+    # structurally equal packets identifiers
+    dup_key = [
+        "tcp.stream",
+        "ip.id",
+        "tcp.seq_raw",
+        "tcp.ack_raw",
+        "tcp.len",
+        "tcp.flags",
+    ]
+
+    # checks time diff for capture copy
+    df_feat["dt_dup"] = df_feat.groupby(dup_key)["frame.time_epoch"].diff()
+    is_capture_copy = df_feat["dt_dup"] < 0.001
+
+    df_feat = df_feat[~is_capture_copy].drop(columns=["dt_dup"])
+
+    # discarding flows which first packet is not SYN
+    first_packets = df_feat.groupby("tcp.stream")["tcp.flags"].first()
+    valid_flows = first_packets[
+        first_packets.astype(str).str.contains("0x0002", na=False)
+    ].index.to_list()
+    df_feat = df_feat[df_feat["tcp.stream"].isin(valid_flows)]
+
     # creating flow i column
     df_feat["i"] = df_feat.groupby("tcp.stream").cumcount()
     df_feat = df_feat[df_feat["i"] < n_max]
@@ -38,6 +61,13 @@ def line_per_packet(df: pd.DataFrame, port: int, n_max: int):
             "tcp.ack_raw": "h_ack",
         }
     )
+
+    # converting hex to dec
+    hex_cols = ["f_flags", "h_ipid", "h_ipcsum", "h_tcpcsum"]
+    for col in hex_cols:
+        df_feat[col] = df_feat[col].apply(
+            lambda x: int(str(x), 16) if pd.notna(x) and isinstance(x, str) else x
+        )
 
     # exporting final columns: features and metadata
     final_columns = [
