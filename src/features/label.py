@@ -7,7 +7,7 @@ def extract_labels(
 ) -> pd.DataFrame:
     df_raw = df.copy()
 
-    df_raw = df.groupy("tcp.stream").first().reset_index()
+    df_raw = df.groupby("tcp.stream").first().reset_index()
 
     # identifying conection origin
     df_raw["is_client_src"] = df_raw["tcp.srcport"] != port
@@ -24,4 +24,5 @@ def extract_labels(
     if df_raw["label"].isna().any():
         raise ValueError("unknown IPs detected in capture. verify the environment.")
 
-    return df_raw
+    df_raw = df_raw.rename(columns={"tcp.stream": "flow_id"})
+    return df_raw[["flow_id", "label"]]

@@ -5,6 +5,7 @@ import pandas as pd
 def line_per_packet(df: pd.DataFrame, port: int, n_max: int):
     # copying df for modifying and sorting by stream + timestamp
     df_feat = df.copy()
+    stats = {"raw": len(df_feat), "initial_flows": df_feat["tcp.stream"].nunique()}
     df_feat = df_feat.sort_values(by=["tcp.stream", "frame.time_epoch"])
 
     # structurally equal packets identifiers
@@ -23,13 +24,20 @@ def line_per_packet(df: pd.DataFrame, port: int, n_max: int):
     df_feat["dt_dup"] = df_feat.groupby(dup_key)["frame.time_epoch"].diff()
     is_capture_copy = df_feat["dt_dup"] < 0.001
 
-    df_feat = df_feat[~is_capture_copy].drop(columns=["dt_dup"])
+    stats["removed_duplicates"] = is_capture_copy.sum()
+    df_feat = df_feat[~is_capture_copy].drop(columns="dt_dup")
 
-    # discarding flows which first packet is not SYN
+    # SYN filter
     first_packets = df_feat.groupby("tcp.stream")["tcp.flags"].first()
-    valid_flows = first_packets[
-        first_packets.astype(str).str.contains("0x0002", na=False)
-    ].index.to_list()
+
+    def is_syn(flag_val):
+        try:
+            return (int(str(flag_val), 16) & 0x02) != 0
+        except:
+            return False
+
+    valid_flows = first_packets[first_packets.apply(is_syn)].index.to_list()
+    stats["flows_wo_syn"] = stats["initial_flows"] - len(valid_flows)
     df_feat = df_feat[df_feat["tcp.stream"].isin(valid_flows)]
 
     # creating flow i column
@@ -90,13 +98,17 @@ def line_per_packet(df: pd.DataFrame, port: int, n_max: int):
         "h_ack",
     ]
 
-    return df_feat[final_columns]
+    return df_feat[final_columns], stats
 
 
 def flatten_flows(df: pd.DataFrame):
+    t_min = df["frame.time_epoch"].min()
     df_meta = (
         df.groupby("tcp.stream")
-        .agg(t_start=("frame.time_epoch", "min"), n_pkts=("tcp.stream", "count"))
+        .agg(
+            t_start=("frame.time_epoch", lambda x: x.min() - t_min),
+            n_pkts=("tcp.stream", "count"),
+        )
         .reset_index()
     )
 
@@ -108,5 +120,22 @@ def flatten_flows(df: pd.DataFrame):
 
     df_final = pd.merge(df_meta, df_flat, on="tcp.stream")
     df_final = df_final.rename(columns={"tcp.stream": "flow_id"})
+
+    for col in df_final.columns:
+        if df_final[col].dtype == "float64" and col.startswith(
+            (
+                "b_dir",
+                "b_plen",
+                "f_flags",
+                "f_win",
+                "h_ttl",
+                "h_ipid",
+                "h_ipcsum",
+                "h_tcpcsum",
+                "h_seq",
+                "h_ack",
+            )
+        ):
+            df_final[col] = df_final[col].astype("Int64")
 
     return df_final
