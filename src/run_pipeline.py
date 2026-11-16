@@ -10,14 +10,14 @@ from features.label import extract_labels
 
 
 def parse_metadata(filename: str):
-    """extracts run_id, type, series, value and rep from filename"""
+    """extracts run_id, pcap_type, series, value and rep from filename"""
 
     run_id = filename.replace("_packets", "")
     parts = run_id.split("_")
     rep_str = parts[-1].replace("rep", "")
 
     if run_id.startswith("benigno"):
-        return run_id, "benigno", "benigno", 0, rep_str
+        return run_id, "benign", "benign", 0, rep_str
 
     # matches pattern like 'taxa100' -> group(1)='taxa', group(2)='100'
     match = re.match(r"([a-zA-Z]+)(\d+)", parts[0])
@@ -28,16 +28,24 @@ def parse_metadata(filename: str):
         series = parts[0]
         value = 0
 
-    return run_id, "ataque", series, value, rep_str
+    return run_id, "attack", series, value, rep_str
 
 
 def run_pipeline(df: pd.DataFrame, filename: str) -> pd.DataFrame:
     df_raw = df.copy()
 
-    df_features = line_per_packet(df_raw, port=config.PORT, n_max=config.N_MAX)
+    df_features, stats = line_per_packet(df_raw, port=config.PORT, n_max=config.N_MAX)
+    print(
+        f"  -> DISCARDED: {stats['removed_duplicates']} cloned packets, {stats['flows_wo_syn']} flows without SYN"
+    )
     df_flat = flatten_flows(df_features)
 
-    df_labels = extract_labels(df_raw, port=config.PORT, attacker_ip=config.ATTACKER_IP)
+    df_labels = extract_labels(
+        df_raw,
+        port=config.PORT,
+        attacker_ip=config.ATTACKER_IP,
+        benign_ip=config.BENIGN_IP,
+    )
 
     df_final = merge_features_labels(df_flat, df_labels)
 
@@ -45,7 +53,7 @@ def run_pipeline(df: pd.DataFrame, filename: str) -> pd.DataFrame:
     run_id, flow_type, series, value, rep = parse_metadata(filename)
 
     df_final["run_id"] = run_id
-    df_final["type"] = flow_type
+    df_final["flow_type"] = flow_type
     df_final["series"] = series
     df_final["value"] = value
     df_final["rep"] = rep

@@ -15,7 +15,7 @@ def check_data_leakage(df: pd.DataFrame):
         "flow_id",
         "run_id",
         "label",
-        "type",
+        "flow_type",
         "series",
         "value",
         "rep",
@@ -46,6 +46,37 @@ def check_nans(df: pd.DataFrame):
     print()
 
 
+def check_invariants(df: pd.DataFrame):
+    df_check = df.copy()
+
+    # no IP leakage or absolute timestamps
+    assert not any(
+        col.startswith(("ip.", "frame.time_epoch")) for col in df_check.columns
+    ), "feature leakage detected."
+
+    # the first packet from all flows must be client's SYN -> dir 1
+    assert (
+        df_check["b_dir_1"] == 1
+    ).all(), "there are flows where the first packet didn't come from client"
+    assert (df_check["b_iat_1"] == 0).all(), "first packet's IAT must be strictly 0."
+    assert (
+        df_check["b_t_1"] == 0
+    ).all(), "first packet's timestamp must be strictly 0."
+    assert (
+        df_check["f_flags_1"] == 2
+    ).all(), "there are flows where the first packet isn't a pure SYN."
+
+    # counting ranges
+    assert df["n_pkts"].between(1, 8).all(), "there are flows with n_pkts out of range."
+    assert df["flow_id"].is_unique, "there are flow_id collisions in the final dataset."
+
+    # label and metadada consistence
+    benigns = df[df["flow_type"] == "benign"]
+    assert (
+        benigns["label"] == 0
+    ).all(), "flows marked as benign_only have attack's label=1"
+
+
 if __name__ == "__main__":
     file_final = config.PROCESSED_DIR / "flows_n8_v1.csv"
     print(f"starting QA: {file_final.name}\n")
@@ -55,5 +86,6 @@ if __name__ == "__main__":
     check_data_leakage(df_final)
     check_labels(df_final)
     check_nans(df_final)
+    check_invariants(df_final)
 
     print("QA successfully finished")
