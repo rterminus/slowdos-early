@@ -9,8 +9,10 @@ def line_per_packet(df: pd.DataFrame, port: int, n_max: int):
 
     # structurally equal packets identifiers
     dup_key = [
-        "tcp.stream",
         "ip.id",
+        "tcp.stream",
+        "tcp.srcport",
+        "tcp.dstport",
         "tcp.seq_raw",
         "tcp.ack_raw",
         "tcp.len",
