@@ -48,6 +48,7 @@ def main():
     for pcap_path in pcap_dir.glob("*.pcap"):
         if not valid_pattern.match(pcap_path.stem):
             print(f"ignoring non-pattern file: {pcap_path.name}")
+            continue
 
         csv_name = f"{pcap_path.stem}_packets.csv"
         output_path = config.INTERIM_DIR / csv_name
