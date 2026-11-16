@@ -24,5 +24,7 @@ def extract_labels(
     if df_raw["label"].isna().any():
         raise ValueError("unknown IPs detected in capture. verify the environment.")
 
+    df_raw["label"] = df_raw["label"].astype(int)
     df_raw = df_raw.rename(columns={"tcp.stream": "flow_id"})
+
     return df_raw[["flow_id", "label"]]
