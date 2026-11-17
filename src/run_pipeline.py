@@ -31,7 +31,7 @@ def parse_metadata(filename: str):
     return run_id, "attack", series, value, rep_str
 
 
-def run_pipeline(df: pd.DataFrame, filename: str) -> pd.DataFrame:
+def run_pipeline(df: pd.DataFrame, filename: str):
     df_raw = df.copy()
 
     df_features, stats = line_per_packet(df_raw, port=config.PORT, n_max=config.N_MAX)
@@ -61,12 +61,13 @@ def run_pipeline(df: pd.DataFrame, filename: str) -> pd.DataFrame:
     # preventing duplates across different PCAPs
     df_final["flow_id"] = run_id + "_" + df_final["flow_id"].astype(str)
 
-    return df_final
+    return df_final, stats
 
 
 if __name__ == "__main__":
     print("initializing feature extraction pipeline...")
     all_flows = []
+    all_stats = []
 
     valid_pattern = re.compile(r"^(taxa\d+|intervalo\d+|benigno_only)_rep\d+$")
 
@@ -81,12 +82,23 @@ if __name__ == "__main__":
         print(f"processing: {csv_path.name}")
         df_raw = pd.read_csv(csv_path)
 
-        df_processed = run_pipeline(df_raw, filename=csv_path.stem)
+        df_processed, stats = run_pipeline(df_raw, filename=csv_path.stem)
         all_flows.append(df_processed)
+
+        # article auxiliary counts
+        stats["pcap"] = run_id
+        stats["final_flows"] = df_processed["flow_id"].nunique()
+        all_stats.append(stats)
 
     df_consolidated = pd.concat(all_flows, ignore_index=True)
 
     output_path = config.PROCESSED_DIR / "flows_n8_v1.csv"
     df_consolidated.to_csv(output_path, index=False)
 
+    # writing count log for article
+    df_stats = pd.DataFrame(all_stats)
+    stats_path = config.PROCESSED_DIR / "counts_by_pcap.csv"
+    df_stats.to_csv(stats_path, index=False)
+
     print(f"success! {len(df_consolidated)} flows saved to {output_path}.")
+    print(f"sucess! counts log saved to {stats_path}")

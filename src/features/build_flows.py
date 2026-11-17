@@ -68,6 +68,7 @@ def line_per_packet(df: pd.DataFrame, port: int, n_max: int):
             "tcp.len": "b_plen",
             "tcp.flags": "f_flags",
             "tcp.window_size_value": "f_win",
+            "tcp.analysis.retransmission": "f_retrans",
             "ip.ttl": "h_ttl",
             "ip.id": "h_ipid",
             "ip.checksum": "h_ipcsum",
@@ -85,6 +86,11 @@ def line_per_packet(df: pd.DataFrame, port: int, n_max: int):
                 lambda x: int(str(x), 16) if pd.notna(x) and isinstance(x, str) else x
             )
 
+    # retransmission treatment
+    if "f_retrans" in df_feat.columns:
+        # fills in nulls with 0 and guarantees numeric column
+        df_feat["f_retrans"] = pd.to_numeric(df_feat["f_retrans"]).fillna(0).astype(int)
+
     # exporting final columns: features and metadata
     final_columns = [
         "tcp.stream",
@@ -96,6 +102,7 @@ def line_per_packet(df: pd.DataFrame, port: int, n_max: int):
         "b_t",
         "f_flags",
         "f_win",
+        "f_retrans",
         "h_ttl",
         "h_ipid",
         "h_ipcsum",
@@ -116,7 +123,7 @@ def flatten_flows(df: pd.DataFrame):
         .agg(
             t_start=("frame.time_epoch", lambda x: x.min() - t_min),
             n_pkts=("tcp.stream", "count"),
-            no_response=("b_dir", lambda x: int(x.min() > 0))
+            no_response=("b_dir", lambda x: int(x.min() > 0)),
         )
         .reset_index()
     )
@@ -137,6 +144,7 @@ def flatten_flows(df: pd.DataFrame):
                 "b_plen",
                 "f_flags",
                 "f_win",
+                "f_retrans"
                 "h_ttl",
                 "h_ipid",
                 "h_ipcsum",
