@@ -28,7 +28,7 @@ The pipeline flattens the first 8 packets into one row per flow. For each packet
 - `h_seq_i`: TCP sequence number (raw).
 - `h_ack_i`: TCP acknowledgment number (raw).
 - `h_ipcsum_i`: IPv4 header checksum.
-- `h_tcpcsum_i`: TCP checksum (includes the IPv4 pseudo-header with Source/Destination IPs, acting as a static identifier when hardware offload is enabled).
+- `h_tcpcsum_i`: TCP checksum (includes the IPv4 pseudo-header with Source/Destination IPs, acting as a static identifier when hardware offload is enabled) — extracted, but removed from training features
 - `f_flags_i`: Integer representation of TCP flags (Wireshark 12-bit format).
 - `f_win_i`: Announced TCP window size (`tcp.window_size_value`), raw unscaled value.
 - `f_retrans_i`: Binary value indicating packet retransmission (1 for retransmission, 0 for normal packet).
