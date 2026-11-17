@@ -8,8 +8,8 @@ def line_per_packet(df: pd.DataFrame, port: int, n_max: int):
     stats = {"raw": len(df_feat), "initial_flows": df_feat["tcp.stream"].nunique()}
     df_feat = df_feat.sort_values(by=["tcp.stream", "frame.time_epoch"])
 
-    # structurally equal packets identifiers
-    dup_key = [
+    # structurally equal packets identifiers (com segurança caso ip.id não exista)
+    possible_dup_keys = [
         "ip.id",
         "tcp.stream",
         "tcp.srcport",
@@ -19,15 +19,16 @@ def line_per_packet(df: pd.DataFrame, port: int, n_max: int):
         "tcp.len",
         "tcp.flags",
     ]
+    dup_key = [col for col in possible_dup_keys if col in df_feat.columns]
 
-    # checks time diff for capture copy
-    df_feat["dt_dup"] = df_feat.groupby(dup_key)["frame.time_epoch"].diff()
-    is_capture_copy = df_feat["dt_dup"] < 0.001
+    if dup_key:
+        df_feat["dt_dup"] = df_feat.groupby(dup_key)["frame.time_epoch"].diff()
+        is_capture_copy = df_feat["dt_dup"] < 0.001
+        stats["removed_duplicates"] = is_capture_copy.sum()
+        df_feat = df_feat[~is_capture_copy].drop(columns="dt_dup")
+    else:
+        stats["removed_duplicates"] = 0
 
-    stats["removed_duplicates"] = is_capture_copy.sum()
-    df_feat = df_feat[~is_capture_copy].drop(columns="dt_dup")
-
-    # SYN filter
     first_packets = df_feat.groupby("tcp.stream")["tcp.flags"].first()
 
     def is_syn(flag_val):
@@ -57,7 +58,11 @@ def line_per_packet(df: pd.DataFrame, port: int, n_max: int):
         "frame.time_epoch"
     ].transform("min")
 
-    # renaming columns
+    # avoiding tcp.checksum collision
+    tcp_csum_col = (
+        "tcp.checksum.1" if "tcp.checksum.1" in df_feat.columns else "tcp.checksum"
+    )
+
     df_feat = df_feat.rename(
         columns={
             "tcp.len": "b_plen",
@@ -66,7 +71,7 @@ def line_per_packet(df: pd.DataFrame, port: int, n_max: int):
             "ip.ttl": "h_ttl",
             "ip.id": "h_ipid",
             "ip.checksum": "h_ipcsum",
-            "tcp.checksum": "h_tcpcsum",
+            tcp_csum_col: "h_tcpcsum",
             "tcp.seq_raw": "h_seq",
             "tcp.ack_raw": "h_ack",
         }
@@ -75,9 +80,10 @@ def line_per_packet(df: pd.DataFrame, port: int, n_max: int):
     # converting hex to dec
     hex_cols = ["f_flags", "h_ipid", "h_ipcsum", "h_tcpcsum"]
     for col in hex_cols:
-        df_feat[col] = df_feat[col].apply(
-            lambda x: int(str(x), 16) if pd.notna(x) and isinstance(x, str) else x
-        )
+        if col in df_feat.columns:
+            df_feat[col] = df_feat[col].apply(
+                lambda x: int(str(x), 16) if pd.notna(x) and isinstance(x, str) else x
+            )
 
     # exporting final columns: features and metadata
     final_columns = [
@@ -97,6 +103,8 @@ def line_per_packet(df: pd.DataFrame, port: int, n_max: int):
         "h_seq",
         "h_ack",
     ]
+
+    final_columns = [c for c in final_columns if c in df_feat.columns]
 
     return df_feat[final_columns], stats
 
