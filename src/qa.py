@@ -19,6 +19,7 @@ def check_data_leakage(df: pd.DataFrame):
         "series",
         "value",
         "rep",
+        "no_response",
     )
     for column in df.columns:
         assert column.startswith(allowed_prefixes), f"data leakage detected: {column}"

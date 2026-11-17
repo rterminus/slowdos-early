@@ -116,6 +116,7 @@ def flatten_flows(df: pd.DataFrame):
         .agg(
             t_start=("frame.time_epoch", lambda x: x.min() - t_min),
             n_pkts=("tcp.stream", "count"),
+            no_response=("b_dir", lambda x: int(x.min() > 0))
         )
         .reset_index()
     )
