@@ -109,6 +109,7 @@ def line_per_packet(df: pd.DataFrame, port: int, n_max: int):
         "h_tcpcsum",
         "h_seq",
         "h_ack",
+        "ip.src",
     ]
 
     final_columns = [c for c in final_columns if c in df_feat.columns]
@@ -124,11 +125,12 @@ def flatten_flows(df: pd.DataFrame):
             t_start=("frame.time_epoch", lambda x: x.min() - t_min),
             n_pkts=("tcp.stream", "count"),
             no_response=("b_dir", lambda x: int(x.min() > 0)),
+            ip_src=("ip.src", "first")
         )
         .reset_index()
     )
 
-    df = df.drop(columns=["frame.time_epoch"])
+    df = df.drop(columns=["frame.time_epoch", "ip.src"])
 
     df_flat = df.pivot(index="tcp.stream", columns="i")
     df_flat.columns = [f"{feat}_{pos + 1}" for feat, pos in df_flat.columns]
@@ -154,5 +156,9 @@ def flatten_flows(df: pd.DataFrame):
             )
         ):
             df_final[col] = df_final[col].astype("Int64")
+
+    # avoiding IP data leakage
+    if "ip_src" in df_final.columns:
+         df_final = df_final.drop(columns=["ip_src"])
 
     return df_final
