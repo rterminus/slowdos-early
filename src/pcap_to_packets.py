@@ -31,7 +31,8 @@ def extract_pcap(pcap_path: Path, output_csv: Path):
         "-e", "tcp.checksum",
         "-e", "tcp.window_size_value",
         "-e", "tcp.seq_raw",
-        "-e", "tcp.ack_raw"
+        "-e", "tcp.ack_raw",
+        "-e", "tcp.analysis.retransmission"
     ]
 
     with open(output_csv, "w") as f:
