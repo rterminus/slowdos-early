@@ -1,3 +1,9 @@
+"""Evaluate a classical Hoeffding Tree for early DDoS detection.
+
+Train on rep1 attack-period flows, calibrate on rep1 healthy benign flows,
+and evaluate on rep2/rep3 without updating the trained model.
+"""
+
 from __future__ import annotations
 import argparse
 import json
@@ -15,27 +21,28 @@ from statsmodels.stats.proportion import proportion_confint
 
 LOGGER = logging.getLogger(__name__)
 TARGET_FPR = 0.01
-SCENARIOS = ('Global', 'Respondido')
+SCENARIOS = ('Global', 'Responded')
 GROUPS = ('A1', 'A2b', 'A3')
 WINDOWS = (3, 4, 5, 6, 7, 8)
 GRACE_PERIOD, DELTA, TAU = 50, 0.05, 0.2
 
 def load_data(data_path: Path) -> pd.DataFrame:
+    """Validate the CSV and assign train, calibration, and test phases."""
     if not data_path.is_file():
-        raise FileNotFoundError(f'CSV não encontrado: {data_path.resolve()}. Ajuste data_path.')
+        raise FileNotFoundError(f'CSV not found: {data_path.resolve()}. Check --data.')
     raw = pd.read_csv(data_path)
     required = {'run_id', 'flow_type', 't_start', 'label', 'no_response'}
     missing = required - set(raw.columns)
     if missing:
-        raise ValueError(f'Colunas obrigatórias ausentes: {sorted(missing)}')
+        raise ValueError(f'Missing required columns: {sorted(missing)}')
     raw['flow_type'] = raw['flow_type'].astype(str).str.strip()
     raw['rep'] = pd.to_numeric(raw['run_id'].astype(str).str.extract(r'rep(\d+)')[0], errors='coerce')
     if raw['rep'].isna().any() or not raw['rep'].isin([1, 2, 3]).all():
-        raise ValueError('run_id deve identificar rep1, rep2 ou rep3 em todos os registros.')
+        raise ValueError('Every run_id must identify rep1, rep2, or rep3.')
     if raw[['label','no_response']].isna().any().any():
-        raise ValueError('label e no_response não podem conter valores ausentes.')
+        raise ValueError('label and no_response cannot contain missing values.')
     if not set(raw['label'].unique()).issubset({0, 1}) or not set(raw['no_response'].unique()).issubset({0, 1}):
-        raise ValueError('label e no_response devem ser binários (0/1).')
+        raise ValueError('label and no_response must be binary (0/1).')
     raw['rep'] = raw['rep'].astype(int)
     raw['_healthy'] = raw['flow_type'].eq('benign')
     raw['_phase'] = np.select([
@@ -45,9 +52,8 @@ def load_data(data_path: Path) -> pd.DataFrame:
     raw = raw.sort_values(['rep', 't_start', 'run_id'], kind='stable').reset_index(drop=True)
     return raw
 
-import re
-
 def feature_columns(df, n, group):
+    """Select features from the first n packets for the ablation group."""
     prefixes = {'A1': ('b_',), 'A2b': ('b_', 'f_flags_'),
                 'A3': ('b_', 'f_flags_', 'f_retrans_')}[group]
     selected = []
@@ -58,7 +64,7 @@ def feature_columns(df, n, group):
         if m and 1 <= int(m.group(1)) <= n:
             selected.append(col)
     if not selected:
-        raise ValueError(f'Sem features para {group}, N={n}. Verifique os nomes das colunas.')
+        raise ValueError(f'No features found for {group}, N={n}. Check column names.')
     return selected
 
 def to_x(row, cols):
@@ -74,11 +80,13 @@ def to_x(row, cols):
     return x
 
 def model_new(cols, grace_period=GRACE_PERIOD, delta=DELTA, tau=TAU):
+    """Create a standard Hoeffding Tree with majority-class leaves."""
     nominal = [c for c in cols if c.startswith(('f_flags_', 'f_retrans_'))]
     return tree.HoeffdingTreeClassifier(grace_period=grace_period,
         delta=delta, tau=tau, leaf_prediction='mc', nominal_attributes=nominal)
 
 def predict_scores(model, df, cols):
+    """Predict attack scores without updating the model."""
     scores = []
     for row in df[cols].itertuples(index=False, name=None):
         x = {c: (str(int(float(v))) if c.startswith(('f_flags_', 'f_retrans_')) else float(v))
@@ -87,6 +95,7 @@ def predict_scores(model, df, cols):
     return np.asarray(scores)
 
 def train_model(model, df, cols):
+    """Incrementally train on the designated training split only."""
     for values in df[cols + ['label']].itertuples(index=False, name=None):
         x = {c: (str(int(float(v))) if c.startswith(('f_flags_', 'f_retrans_')) else float(v))
              for c, v in zip(cols, values[:-1]) if pd.notna(v)}
@@ -94,11 +103,12 @@ def train_model(model, df, cols):
     return model
 
 def calibrated_threshold(benign_scores, alpha=0.01):
-    # Limiar conservador: para classificação score > threshold, garante
-    # empiricamente <= alpha falsos positivos no conjunto de calibração.
+    """Choose a threshold with empirical calibration FPR <= alpha."""
+    # Predictions are positive only when score > threshold.
+    # Ties at the threshold therefore count as negative predictions.
     s = np.sort(np.asarray(benign_scores, dtype=float))
     if not len(s):
-        raise ValueError('Calibração sem exemplos benignos.')
+        raise ValueError('No benign examples available for calibration.')
     k = int(np.floor(alpha * len(s)))
     if k == 0:
         return float(s[-1])
@@ -110,6 +120,7 @@ def wilson(k, total):
     return tuple(map(float, proportion_confint(k, total, alpha=0.05, method='wilson')))
 
 def metrics(y, scores, threshold):
+    """Compute confusion counts, classification metrics, and Wilson intervals."""
     y = np.asarray(y, dtype=int)
     pred = (np.asarray(scores) > threshold).astype(int)
     tp = int(((y == 1) & (pred == 1)).sum())
@@ -132,22 +143,25 @@ def metrics(y, scores, threshold):
 
 
 def run_experiment(raw: pd.DataFrame, out_dir: Path, target_fpr: float = TARGET_FPR, grace_period: int = GRACE_PERIOD, delta: float = DELTA, tau: float = TAU):
+    """Run all scenario, feature-group, and packet-window combinations."""
     rows, breakdown, predictions = [], [], []
     for scenario in SCENARIOS:
         df = raw if scenario == 'Global' else raw.loc[raw.no_response.eq(0)].copy()
+        # Keep training, threshold calibration, and testing independent.
         train = df.loc[df._phase.eq('train')]
         cal = df.loc[df._phase.eq('calibration') & df.label.eq(0)]
         test = df.loc[df._phase.eq('test')]
         if len(train) == 0 or len(cal) == 0 or len(test) == 0:
-            raise ValueError(f'Fase vazia no cenário {scenario}.')
+            raise ValueError(f'Empty data split in scenario {scenario}.')
         if train.label.nunique() < 2:
-            raise ValueError(f'Treinamento do cenário {scenario} não contém as duas classes.')
+            raise ValueError(f'Training data in scenario {scenario} does not contain both classes.')
         for group in GROUPS:
             for N in WINDOWS:
                 cols = feature_columns(df, N, group)
                 model = train_model(model_new(cols, grace_period, delta, tau), train, cols)
                 cal_scores = predict_scores(model, cal, cols)
                 threshold = calibrated_threshold(cal_scores, target_fpr)
+                # The trained tree is frozen during the test phase.
                 scores = predict_scores(model, test, cols)
                 yy = test.label.to_numpy(dtype=int)
                 main = metrics(yy, scores, threshold)
@@ -156,8 +170,8 @@ def run_experiment(raw: pd.DataFrame, out_dir: Path, target_fpr: float = TARGET_
                 rows.append({**key, 'Features':len(cols), 'Train_n':len(train),
                     'Calibration_n':len(cal), 'Test_n':len(test), 'Threshold':threshold,
                     'FPR_calibration':cal_fpr, **main,
-                    'FPR_le_1pct':bool(np.isfinite(main['FPR']) and main['FPR'] <= target_fpr),
-                    'FPR_CI_upper_le_1pct':bool(np.isfinite(main['FPR_CI_high']) and main['FPR_CI_high'] <= target_fpr)})
+                    'FPR_within_target':bool(np.isfinite(main['FPR']) and main['FPR'] <= target_fpr),
+                    'FPR_CI_upper_within_target':bool(np.isfinite(main['FPR_CI_high']) and main['FPR_CI_high'] <= target_fpr)})
                 detail = test[['rep','flow_type','label','no_response']].copy()
                 detail['p_attack'] = scores
                 detail['pred'] = (scores > threshold).astype(int)
@@ -168,17 +182,18 @@ def run_experiment(raw: pd.DataFrame, out_dir: Path, target_fpr: float = TARGET_
                     if mask.any():
                         sub = metrics(yy[mask.to_numpy()], scores[mask.to_numpy()], threshold)
                         breakdown.append({**key, 'Subset':name, **sub})
-            LOGGER.info('Concluído: %s | %s', scenario, group)
+            LOGGER.info('Completed: %s | %s', scenario, group)
 
     results = pd.DataFrame(rows)
     strata = pd.DataFrame(breakdown)
     predictions_df = pd.concat(predictions, ignore_index=True)
-    results.to_csv(out_dir/'metricas_36_configuracoes.csv', index=False)
-    strata.to_csv(out_dir/'metricas_estratificadas.csv', index=False)
-    predictions_df.to_csv(out_dir/'previsoes_teste.csv', index=False)
+    results.to_csv(out_dir/'metrics_36_configurations.csv', index=False)
+    strata.to_csv(out_dir/'stratified_metrics.csv', index=False)
+    predictions_df.to_csv(out_dir/'test_predictions.csv', index=False)
     return results, strata, predictions_df
 
 def save_plots(results, predictions_df, out_dir: Path, target_fpr: float = TARGET_FPR):
+    """Save the main metrics dashboard and ROC/PR curves."""
     plt.rcParams.update({'figure.dpi':120, 'savefig.dpi':180})
     fig, axes = plt.subplots(2, 2, figsize=(13, 9), constrained_layout=True)
     for (sc, gr), d in results.groupby(['Scenario','Ablation'], sort=False):
@@ -188,18 +203,18 @@ def save_plots(results, predictions_df, out_dir: Path, target_fpr: float = TARGE
         axes[0,1].plot(d.N, d.FPR, marker='o', label=label)
         axes[1,0].scatter(d.FPR, d.Recall, label=label)
         axes[1,1].plot(d.N, d.ROC_AUC, marker='o', label=label)
-    axes[0,0].set(title='Recall dos ataques', ylabel='Recall', xlabel='Pacotes observados (N)', ylim=(-.02,1.02))
-    axes[0,1].set(title='FPR em todos os benignos do teste', ylabel='FPR', xlabel='Pacotes observados (N)')
-    axes[0,1].axhline(target_fpr, linestyle='--', color='black', label='Meta 1%')
-    axes[1,0].set(title='Compromisso Recall × FPR', xlabel='FPR', ylabel='Recall', ylim=(-.02,1.02))
+    axes[0,0].set(title='Attack recall', ylabel='Recall', xlabel='Observed packets (N)', ylim=(-.02,1.02))
+    axes[0,1].set(title='FPR across all benign test flows', ylabel='FPR', xlabel='Observed packets (N)')
+    axes[0,1].axhline(target_fpr, linestyle='--', color='black', label='1% target')
+    axes[1,0].set(title='Recall vs. FPR', xlabel='FPR', ylabel='Recall', ylim=(-.02,1.02))
     axes[1,0].axvline(target_fpr, linestyle='--', color='black')
-    axes[1,1].set(title='ROC-AUC', xlabel='Pacotes observados (N)', ylabel='ROC-AUC', ylim=(-.02,1.02))
+    axes[1,1].set(title='ROC-AUC', xlabel='Observed packets (N)', ylabel='ROC-AUC', ylim=(-.02,1.02))
     for ax in axes.flat:
         ax.grid(alpha=.25)
     handles, labels = axes[0,0].get_legend_handles_labels()
     fig.legend(handles, labels, loc='outside lower center', ncol=3)
-    fig.savefig(out_dir/'painel_principal.pdf', bbox_inches='tight')
-    fig.savefig(out_dir/'painel_principal.png', bbox_inches='tight')
+    fig.savefig(out_dir/'main_dashboard.pdf', bbox_inches='tight')
+    fig.savefig(out_dir/'main_dashboard.png', bbox_inches='tight')
     plt.close(fig)
 
     fig2, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5), constrained_layout=True)
@@ -212,37 +227,38 @@ def save_plots(results, predictions_df, out_dir: Path, target_fpr: float = TARGE
             precision, recall, _ = precision_recall_curve(y, s)
             ax1.plot(fpr, tpr, label=scenario)
             ax2.plot(recall, precision, label=scenario)
-    ax1.axvline(target_fpr, color='black', linestyle='--', label='FPR 1%')
-    ax1.set(title='ROC — A3, N=8 (pré-especificado)', xlabel='FPR', ylabel='TPR', xlim=(0,1), ylim=(0,1))
-    ax2.set(title='Precisão–Recall — A3, N=8', xlabel='Recall', ylabel='Precisão', xlim=(0,1), ylim=(0,1))
+    ax1.axvline(target_fpr, color='black', linestyle='--', label='1% FPR')
+    ax1.set(title='ROC — A3, N=8 (pre-specified)', xlabel='FPR', ylabel='TPR', xlim=(0,1), ylim=(0,1))
+    ax2.set(title='Precision–Recall — A3, N=8', xlabel='Recall', ylabel='Precision', xlim=(0,1), ylim=(0,1))
     for ax in (ax1, ax2):
         ax.grid(alpha=.25)
         ax.legend()
-    fig2.savefig(out_dir/'curvas_roc_pr.pdf', bbox_inches='tight')
-    fig2.savefig(out_dir/'curvas_roc_pr.png', bbox_inches='tight')
+    fig2.savefig(out_dir/'roc_pr_curves.pdf', bbox_inches='tight')
+    fig2.savefig(out_dir/'roc_pr_curves.png', bbox_inches='tight')
     plt.close(fig2)
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='Experimento HTC clássica: detecção precoce com FPR <= 1%.')
-    parser.add_argument('--data', type=Path, required=True, help='CSV de fluxos com rep1, rep2 e rep3')
-    parser.add_argument('--output', type=Path, default=Path('resultados_htc_classica'))
+    """Parse command-line options and run the full experiment."""
+    parser = argparse.ArgumentParser(description='Classical Hoeffding Tree: early DDoS detection at FPR <= 1%.')
+    parser.add_argument('--data', type=Path, required=True, help='Flow CSV containing rep1, rep2, and rep3')
+    parser.add_argument('--output', type=Path, default=Path('results/hoeffding_tree'))
     parser.add_argument('--target-fpr', type=float, default=TARGET_FPR)
     parser.add_argument('--grace-period', type=int, default=GRACE_PERIOD)
     parser.add_argument('--delta', type=float, default=DELTA)
     parser.add_argument('--tau', type=float, default=TAU)
     args = parser.parse_args(argv)
     if not 0 < args.target_fpr < 1:
-        parser.error('--target-fpr deve estar entre 0 e 1 (exclusivo).')
+        parser.error('--target-fpr must be strictly between 0 and 1.')
     if args.grace_period <= 0 or not 0 < args.delta < 1 or not 0 <= args.tau <= 1:
-        parser.error('Parâmetros inválidos da Hoeffding Tree.')
+        parser.error('Invalid Hoeffding Tree parameters.')
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     args.output.mkdir(parents=True, exist_ok=True)
     raw = load_data(args.data)
-    LOGGER.info('Dados: %d fluxos; fases: %s', len(raw), raw['_phase'].value_counts().to_dict())
+    LOGGER.info('Loaded %d flows; splits: %s', len(raw), raw['_phase'].value_counts().to_dict())
     results, strata, predictions_df = run_experiment(raw, args.output, args.target_fpr, args.grace_period, args.delta, args.tau)
     save_plots(results, predictions_df, args.output, args.target_fpr)
-    (args.output/'configuracao.json').write_text(json.dumps({'data':str(args.data.resolve()),'target_fpr':args.target_fpr,'grace_period':args.grace_period,'delta':args.delta,'tau':args.tau,'groups':GROUPS,'windows':WINDOWS,'train':'rep1 under_attack','calibration':'rep1 benign','test':'rep2 and rep3, frozen model','leaf_prediction':'mc'},indent=2,ensure_ascii=False),encoding='utf-8')
-    LOGGER.info('Configurações com FPR <= %.2f%%: %d/%d', args.target_fpr*100, int(results['FPR_le_1pct'].sum()), len(results))
-    LOGGER.info('Resultados em: %s', args.output.resolve())
+    (args.output/'experiment_config.json').write_text(json.dumps({'data':str(args.data.resolve()),'target_fpr':args.target_fpr,'grace_period':args.grace_period,'delta':args.delta,'tau':args.tau,'groups':GROUPS,'windows':WINDOWS,'train':'rep1 under_attack','calibration':'rep1 benign','test':'rep2 and rep3, frozen model','leaf_prediction':'mc'},indent=2,ensure_ascii=False),encoding='utf-8')
+    LOGGER.info('Configurations with FPR <= %.2f%%: %d/%d', args.target_fpr*100, int(results['FPR_within_target'].sum()), len(results))
+    LOGGER.info('Results saved to: %s', args.output.resolve())
 
 if __name__ == '__main__':
     main()
