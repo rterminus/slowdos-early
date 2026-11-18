@@ -1,5 +1,10 @@
 temp.py
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+notebooks
+results
 
 # raw capture files
 data/raw/**/*.pcap
